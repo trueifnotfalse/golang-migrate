@@ -1,13 +1,13 @@
-package clickhouse
+package migrator
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
-	_ "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/trueifnotfalse/golang-migrate/interface/driver"
 	"github.com/trueifnotfalse/golang-migrate/interface/migration"
+	"github.com/trueifnotfalse/golang-migrate/interface/migrator"
 	"slices"
-	"time"
 )
 
 const defaultTableName = "migrations"
@@ -17,6 +17,7 @@ type Migrator struct {
 	migrationList []migration.Interface
 	dsn           string
 	tableName     string
+	driver        driver.Interface
 }
 
 func New(dsn string) *Migrator {
@@ -27,13 +28,19 @@ func New(dsn string) *Migrator {
 	}
 }
 
-func (r *Migrator) SetTableName(val string) *Migrator {
+func (r *Migrator) SetDriver(v driver.Interface) migrator.Interface {
+	r.driver = v
+
+	return r
+}
+
+func (r *Migrator) SetTableName(val string) migrator.Interface {
 	r.tableName = val
 
 	return r
 }
 
-func (r *Migrator) Register(values ...migration.Interface) *Migrator {
+func (r *Migrator) Register(values ...migration.Interface) migrator.Interface {
 	for i := 0; i < len(values); i++ {
 		r.migrationList = append(r.migrationList, values[i])
 	}
@@ -89,7 +96,7 @@ func (r *Migrator) Down() error {
 
 func (r *Migrator) openConnection() error {
 	var err error
-	r.conn, err = sql.Open("clickhouse", r.dsn)
+	r.conn, err = sql.Open(r.driver.GetName(), r.dsn)
 	if err != nil {
 		return err
 	}
@@ -122,7 +129,7 @@ func (r *Migrator) downMigrations(appliedMigrationList []string, registeredMigra
 			tx.Rollback()
 			return fmt.Errorf("error on rollback migration: %s, %s", registeredMigrations[appliedMigrationList[i]].Name(), err.Error())
 		}
-		err = r.removeRollbackedMigration(registeredMigrations[appliedMigrationList[i]].Name())
+		err = r.removeRollbackMigration(registeredMigrations[appliedMigrationList[i]].Name())
 		if err != nil {
 			tx.Rollback()
 			return err
@@ -191,7 +198,7 @@ func (r *Migrator) getNotAppliedMigrations(migrationList []string) []migration.I
 }
 
 func (r *Migrator) saveAppliedMigration(name string) error {
-	query := `insert into ` + r.tableName + `(id, name) values(` + fmt.Sprintf("%d", time.Now().UnixNano()) + `, '` + name + `')`
+	query := r.driver.GetSaveSQL(r.tableName, name)
 	_, err := r.conn.Exec(query)
 	if err != nil {
 		return fmt.Errorf("error on saving migration: %s", err.Error())
@@ -200,8 +207,8 @@ func (r *Migrator) saveAppliedMigration(name string) error {
 	return nil
 }
 
-func (r *Migrator) removeRollbackedMigration(name string) error {
-	query := `alter table ` + r.tableName + ` delete where name='` + name + `'`
+func (r *Migrator) removeRollbackMigration(name string) error {
+	query := r.driver.GetDeleteSQL(r.tableName, name)
 	_, err := r.conn.Exec(query)
 	if err != nil {
 		return fmt.Errorf("error on removing migration: %s", err.Error())
@@ -211,7 +218,7 @@ func (r *Migrator) removeRollbackedMigration(name string) error {
 }
 
 func (r *Migrator) getAppliedMigrations() ([]string, error) {
-	query := `select name from ` + r.tableName + ` order by id desc`
+	query := r.driver.GetAppliedSQL(r.tableName)
 	rows, err := r.conn.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("error retrieving applied migrations: %s", err.Error())
@@ -231,11 +238,7 @@ func (r *Migrator) getAppliedMigrations() ([]string, error) {
 }
 
 func (r *Migrator) createMigrationTable() error {
-	query := `create table if not exists ` + r.tableName + ` (
-id         UInt64,
-name       String,
-apply_time DateTime('UTC') default now()
-) Engine=TinyLog`
+	query := r.driver.GetCreateSQL(r.tableName)
 	_, err := r.conn.Exec(query)
 	if err != nil {
 		return fmt.Errorf("error creating migration table: %s", err.Error())
